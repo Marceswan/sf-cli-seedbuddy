@@ -2,6 +2,22 @@
   "name": "sf-cli-seedbuddy",
   "version": "1.0.0",
   "description": "Salesforce CLI plugin to seed records (with children, grandchildren, activities, and files) from a source org to a target org",
+  "author": "Marc Swan",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Marceswan/sf-cli-seedbuddy.git"
+  },
+  "homepage": "https://github.com/Marceswan/sf-cli-seedbuddy",
+  "keywords": [
+    "salesforce",
+    "sf-cli",
+    "sfdx",
+    "seed",
+    "data",
+    "migration",
+    "oclif-plugin"
+  ],
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -12,7 +28,8 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "rm -rf lib"
+    "clean": "rm -rf lib",
+    "prepack": "npm run clean && npm run build && oclif manifest"
   },
   "oclif": {
     "bin": "sf",
@@ -36,6 +53,7 @@
   "devDependencies": {
     "@types/inquirer": "^9",
     "@types/node": "^20",
+    "oclif": "^4.22.77",
     "typescript": "^5"
   }
 }
