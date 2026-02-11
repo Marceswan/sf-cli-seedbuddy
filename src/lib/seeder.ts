@@ -12,6 +12,7 @@ import {
   BATCH_SIZE,
   SYSTEM_READONLY_FIELDS,
   ACTIVITY_SYSTEM_FIELDS,
+  SYSTEM_LOOKUP_OBJECTS,
 } from './types.js';
 import {
   queryAll,
@@ -286,6 +287,180 @@ async function batchUpsert(
 }
 
 // ---------------------------------------------------------------------------
+// Reference field categorization for core object
+// ---------------------------------------------------------------------------
+
+interface RefFieldCategories {
+  systemFields: Set<string>;
+  selfRefFields: Set<string>;
+  dependencyFields: Map<string, string>;  // fieldName -> target object API name
+}
+
+function categorizeReferenceFields(
+  fields: FieldInfo[],
+  coreObjectApiName: string
+): RefFieldCategories {
+  const systemFields = new Set<string>();
+  const selfRefFields = new Set<string>();
+  const dependencyFields = new Map<string, string>();
+
+  for (const f of fields) {
+    if (!f.createable || f.referenceTo.length === 0 || f.type !== 'reference') continue;
+
+    const refs = f.referenceTo;
+
+    // Self-reference (e.g., Account.ParentId → Account)
+    if (refs.length === 1 && refs[0] === coreObjectApiName) {
+      selfRefFields.add(f.name);
+      continue;
+    }
+
+    // All targets are system objects → strip
+    const nonSystemTargets = refs.filter((r) => !SYSTEM_LOOKUP_OBJECTS.has(r));
+    if (nonSystemTargets.length === 0) {
+      systemFields.add(f.name);
+      continue;
+    }
+
+    // Polymorphic with mixed system + non-system: if it includes self, treat as self-ref
+    if (refs.includes(coreObjectApiName)) {
+      selfRefFields.add(f.name);
+      continue;
+    }
+
+    // Single non-system target → data dependency (pull in those records)
+    if (nonSystemTargets.length === 1) {
+      dependencyFields.set(f.name, nonSystemTargets[0]);
+      continue;
+    }
+
+    // Polymorphic with multiple non-system targets — too complex, strip to be safe
+    systemFields.add(f.name);
+  }
+
+  return { systemFields, selfRefFields, dependencyFields };
+}
+
+// ---------------------------------------------------------------------------
+// Seed dependency objects — pull in records referenced by core object lookups
+// ---------------------------------------------------------------------------
+
+async function seedDependencyObjects(
+  config: SeedConfig,
+  sourceRecords: Array<Record<string, unknown>>,
+  dependencyFields: Map<string, string>,
+  idMaps: IdMapCollection,
+  errors: SeedError[]
+): Promise<void> {
+  const { sourceConn, targetConn, logger, dryRun } = config;
+
+  // Collect unique referenced IDs per target object
+  const idsByObject = new Map<string, Set<string>>();
+  const fieldToObject = new Map<string, string>();
+
+  for (const [fieldName, targetObject] of dependencyFields) {
+    fieldToObject.set(fieldName, targetObject);
+    if (!idsByObject.has(targetObject)) {
+      idsByObject.set(targetObject, new Set());
+    }
+    for (const rec of sourceRecords) {
+      const val = rec[fieldName] as string | null;
+      if (val) {
+        idsByObject.get(targetObject)!.add(val);
+      }
+    }
+  }
+
+  for (const [depObjectName, sourceIds] of idsByObject) {
+    if (sourceIds.size === 0) continue;
+    if (idMaps[depObjectName]) continue; // Already seeded
+
+    logger.startSpinner(`Pulling in ${sourceIds.size} referenced ${depObjectName} record(s)...`);
+
+    try {
+      // Check if the object is createable in the target
+      const depTargetFields = await getObjectFields(targetConn, depObjectName);
+      const depTargetCreateable = depTargetFields.some((f) => f.createable);
+      if (!depTargetCreateable) {
+        logger.stopSpinner(`${depObjectName}: not createable in target — stripping lookups`);
+        // Move these fields to "system" category by removing from dependencyFields
+        for (const [fieldName, obj] of dependencyFields) {
+          if (obj === depObjectName) dependencyFields.delete(fieldName);
+        }
+        continue;
+      }
+
+      // Get insertable fields (intersected with target)
+      const depSourceFields = await getObjectFields(sourceConn, depObjectName);
+      const depSourceInsertable = getInsertableFieldNames(depSourceFields);
+      const depTargetCreateableNames = new Set(depTargetFields.filter((f) => f.createable).map((f) => f.name));
+      const depInsertableFields = depSourceInsertable.filter((f) => depTargetCreateableNames.has(f));
+
+      if (depInsertableFields.length === 0) {
+        logger.stopSpinner(`${depObjectName}: no insertable fields — skipping`);
+        for (const [fieldName, obj] of dependencyFields) {
+          if (obj === depObjectName) dependencyFields.delete(fieldName);
+        }
+        continue;
+      }
+
+      const depSelectFields = buildSelectFields(depInsertableFields);
+      const idsArray = [...sourceIds];
+
+      // Query the specific referenced records by ID
+      const depRecords = await queryAllChunked(
+        sourceConn,
+        idsArray,
+        (chunk) => `SELECT ${depSelectFields} FROM ${depObjectName} WHERE Id IN (${inClause(chunk)})`
+      );
+
+      if (depRecords.length === 0) {
+        logger.stopSpinner(`${depObjectName}: no records found`);
+        continue;
+      }
+
+      // Strip all reference fields on dependency records (no cascading)
+      const depRefFieldNames = new Set(
+        depSourceFields
+          .filter((f) => f.createable && f.referenceTo.length > 0 && f.type === 'reference')
+          .map((f) => f.name)
+      );
+
+      const depIdMap: IdMap = new Map();
+      idMaps[depObjectName] = depIdMap;
+
+      const depPrepared: Array<Record<string, unknown>> = [];
+      const depPreparedSourceIds: string[] = [];
+
+      for (const rec of depRecords) {
+        const p: Record<string, unknown> = {};
+        for (const fname of depInsertableFields) {
+          if (rec[fname] === undefined) continue;
+          // Strip all lookup fields on dependency objects (one level only, no cascade)
+          if (depRefFieldNames.has(fname) && rec[fname] !== null) continue;
+          p[fname] = rec[fname];
+        }
+        depPrepared.push(p);
+        depPreparedSourceIds.push(rec['Id'] as string);
+      }
+
+      const result = await batchInsert(
+        targetConn, depObjectName, depPrepared, depPreparedSourceIds,
+        depIdMap, errors, logger, dryRun
+      );
+
+      logger.stopSpinner(`${depObjectName}: ${result.inserted} pulled in, ${result.failed} failed`);
+    } catch (err) {
+      logger.stopSpinnerFail(`${depObjectName}: failed to pull in — ${err instanceof Error ? err.message : String(err)}`);
+      // Remove from dependency fields so the core object strips these lookups
+      for (const [fieldName, obj] of dependencyFields) {
+        if (obj === depObjectName) dependencyFields.delete(fieldName);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Step 1: Seed core object
 // ---------------------------------------------------------------------------
 
@@ -318,36 +493,94 @@ async function seedCoreObject(
     return { objectApiName, queried: 0, inserted: 0, updated: 0, failed: 0, skipped: 0 };
   }
 
+  // Categorize reference fields: system (strip), self-ref (defer), data dependency (pull in)
+  const { systemFields, selfRefFields, dependencyFields } = categorizeReferenceFields(
+    sourceFields.filter((f) => insertableFields.includes(f.name) || selfRefFieldCheck(f, objectApiName)),
+    objectApiName
+  );
+
+  // Pull in dependency records (e.g., custom lookup targets)
+  if (dependencyFields.size > 0) {
+    logger.stopSpinner(`Found ${dependencyFields.size} data dependency lookup(s) to resolve`);
+    await seedDependencyObjects(config, sourceRecords, dependencyFields, idMaps, errors);
+  }
+
+  // Also pull in self-referenced records not in the current batch
+  const selfRefSourceIds = new Set(sourceRecords.map((r) => r['Id'] as string));
+  const extraParentIds = new Set<string>();
+
+  for (const fieldName of selfRefFields) {
+    for (const rec of sourceRecords) {
+      const val = rec[fieldName] as string | null;
+      if (val && !selfRefSourceIds.has(val)) {
+        extraParentIds.add(val);
+      }
+    }
+  }
+
+  // Query and prepend extra parent records so they're inserted first
+  let allRecordsToInsert = [...sourceRecords];
+  if (extraParentIds.size > 0) {
+    logger.startSpinner(`Pulling in ${extraParentIds.size} parent ${objectApiName} record(s)...`);
+    const extraParents = await queryAllChunked(
+      sourceConn,
+      [...extraParentIds],
+      (chunk) => `SELECT ${selectFields} FROM ${objectApiName} WHERE Id IN (${inClause(chunk)})`
+    );
+    logger.stopSpinner(`Pulled in ${extraParents.length} parent record(s)`);
+    // Parents go first so they're in the IdMap when we update self-refs
+    allRecordsToInsert = [...extraParents, ...sourceRecords];
+  }
+
   const coreIdMap: IdMap = new Map();
   idMaps[objectApiName] = coreIdMap;
 
-  // For core object, null out lookup fields that reference records not in the target.
-  // Since it's the root, there are no IdMaps yet — any lookup pointing to a non-standard
-  // object (ParentId to self, RecordTypeId, etc.) would cause INVALID_CROSS_REFERENCE_KEY.
-  const lookupFieldNames = new Set(
-    sourceFields
-      .filter((f) => f.createable && f.referenceTo.length > 0 && f.type === 'reference')
-      .map((f) => f.name)
-  );
+  // Build set of dependency object names that were successfully seeded
+  const resolvedDependencyFields = new Set(dependencyFields.keys());
+
+  // Prepare core records — remap dependency lookups, strip system, defer self-refs
+  logger.startSpinner(`Inserting ${allRecordsToInsert.length} ${objectApiName} records into target...`);
 
   const prepared: Array<Record<string, unknown>> = [];
   const preparedSourceIds: string[] = [];
 
-  for (const rec of sourceRecords) {
+  for (const rec of allRecordsToInsert) {
     const p: Record<string, unknown> = {};
     for (const fname of insertableFields) {
       if (rec[fname] === undefined) continue;
-      if (lookupFieldNames.has(fname) && rec[fname] !== null) {
-        // Skip lookup values — source IDs won't exist in target
+
+      if (systemFields.has(fname) && rec[fname] !== null) {
+        // System lookup — strip
         continue;
       }
+
+      if (selfRefFields.has(fname)) {
+        // Self-reference — defer to post-insert update
+        continue;
+      }
+
+      if (resolvedDependencyFields.has(fname) && rec[fname] !== null) {
+        // Data dependency — remap using IdMap
+        const sourceId = rec[fname] as string;
+        const targetId = findInAnyIdMap(idMaps, sourceId);
+        if (targetId) {
+          p[fname] = targetId;
+        } else {
+          // Dependency record wasn't seeded (maybe it failed) — null out if possible
+          const fieldInfo = sourceFields.find((f) => f.name === fname);
+          if (fieldInfo?.nillable) {
+            p[fname] = null;
+          }
+          // If not nillable, just omit it and let SF use the default
+        }
+        continue;
+      }
+
       p[fname] = rec[fname];
     }
     prepared.push(p);
     preparedSourceIds.push(rec['Id'] as string);
   }
-
-  logger.updateSpinner(`Inserting ${prepared.length} ${objectApiName} records into target...`);
 
   let inserted = 0;
   let updated = 0;
@@ -372,6 +605,64 @@ async function seedCoreObject(
 
   logger.stopSpinner(`${objectApiName}: ${inserted} inserted, ${updated} updated, ${failed} failed`);
 
+  // Post-insert: update self-reference fields using the IdMap
+  if (selfRefFields.size > 0 && coreIdMap.size > 0 && !dryRun) {
+    const updates: Array<Record<string, unknown>> = [];
+
+    for (const rec of allRecordsToInsert) {
+      const sourceId = rec['Id'] as string;
+      const targetId = coreIdMap.get(sourceId);
+      if (!targetId) continue;
+
+      const updateRec: Record<string, unknown> = { Id: targetId };
+      let hasUpdate = false;
+
+      for (const fieldName of selfRefFields) {
+        const refSourceId = rec[fieldName] as string | null;
+        if (refSourceId) {
+          const refTargetId = coreIdMap.get(refSourceId);
+          if (refTargetId) {
+            updateRec[fieldName] = refTargetId;
+            hasUpdate = true;
+          }
+        }
+      }
+
+      if (hasUpdate) {
+        updates.push(updateRec);
+      }
+    }
+
+    if (updates.length > 0) {
+      logger.startSpinner(`Updating ${updates.length} ${objectApiName} self-reference(s)...`);
+
+      for (let i = 0; i < updates.length; i += BATCH_SIZE) {
+        const batch = updates.slice(i, i + BATCH_SIZE);
+        const updateResults = await targetConn.sobject(objectApiName).update(batch as Array<Record<string, unknown> & { Id: string }>);
+        const resultArray = Array.isArray(updateResults) ? updateResults : [updateResults];
+
+        for (const r of resultArray as InsertResult[]) {
+          if (!r.success) {
+            errors.push({
+              object: objectApiName,
+              stage: 'self-ref update',
+              error: formatErrors(r.errors),
+            });
+          }
+        }
+      }
+
+      logger.stopSpinner(`Updated ${updates.length} self-reference(s)`);
+    }
+  } else if (selfRefFields.size > 0 && dryRun) {
+    const selfRefCount = allRecordsToInsert.filter((rec) =>
+      [...selfRefFields].some((f) => rec[f] !== null && rec[f] !== undefined)
+    ).length;
+    if (selfRefCount > 0) {
+      logger.log(`  [DRY RUN] Would update ${selfRefCount} self-reference(s) after insert`);
+    }
+  }
+
   return {
     objectApiName,
     queried: sourceRecords.length,
@@ -380,6 +671,11 @@ async function seedCoreObject(
     failed,
     skipped: 0,
   };
+}
+
+// Helper for categorizeReferenceFields — check if a field is a self-ref candidate
+function selfRefFieldCheck(f: FieldInfo, objectApiName: string): boolean {
+  return f.createable && f.type === 'reference' && f.referenceTo.includes(objectApiName);
 }
 
 // ---------------------------------------------------------------------------

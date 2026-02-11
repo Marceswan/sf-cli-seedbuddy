@@ -165,6 +165,61 @@ export const ACTIVITY_SYSTEM_FIELDS = new Set([
   'RecurrenceActivityId',
 ]);
 
+// Objects whose lookups should be stripped — platform/config records, not user data.
+// IDs for these objects are org-specific and won't match across orgs.
+export const SYSTEM_LOOKUP_OBJECTS = new Set([
+  // Platform / Identity
+  'User',
+  'Group',
+  'Organization',
+  'Profile',
+  'UserRole',
+  'PermissionSet',
+  'PermissionSetGroup',
+  'ConnectedApplication',
+  // Metadata / Config
+  'RecordType',
+  'BusinessProcess',
+  'ApexClass',
+  'ApexTrigger',
+  'CustomPermission',
+  'EmailTemplate',
+  'Folder',
+  'ListView',
+  'Layout',
+  // Service / Entitlements
+  'BusinessHours',
+  'Entitlement',
+  'EntitlementTemplate',
+  'Milestone',
+  'MilestoneType',
+  'SlaProcess',
+  // Territory
+  'Territory2',
+  'Territory2Model',
+  'Territory2Type',
+  // Multi-currency
+  'CurrencyType',
+  'DatedConversionRate',
+  // Other platform objects
+  'Division',
+  'QueueSobject',
+  'Calendar',
+  'CollaborationGroup',
+  'Network',
+  'Site',
+  'Community',
+  'BrandTemplate',
+  'DandBCompany',
+  'PartnerRole',
+  'DuplicateRecordSet',
+  'DuplicateRecordItem',
+  'DuplicateRule',
+  'MatchingRule',
+  'Period',
+  'FiscalYearSettings',
+]);
+
 export const EXCLUDED_CHILD_OBJECTS = new Set([
   'Task',
   'Event',
