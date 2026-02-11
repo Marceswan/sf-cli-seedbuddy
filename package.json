@@ -1,0 +1,41 @@
+{
+  "name": "sf-cli-seedbuddy",
+  "version": "1.0.0",
+  "description": "Salesforce CLI plugin to seed records (with children, grandchildren, activities, and files) from a source org to a target org",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "messages",
+    "oclif.manifest.json"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rm -rf lib"
+  },
+  "oclif": {
+    "bin": "sf",
+    "commands": "./lib/commands",
+    "topicSeparator": " ",
+    "flexibleTaxonomy": true,
+    "topics": {
+      "seedbuddy": {
+        "description": "Commands for seeding records between Salesforce orgs"
+      }
+    }
+  },
+  "dependencies": {
+    "@oclif/core": "^4",
+    "@salesforce/core": "^8",
+    "@salesforce/sf-plugins-core": "^12",
+    "chalk": "^5.3.0",
+    "inquirer": "^9.2.12",
+    "inquirer-autocomplete-prompt": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9",
+    "@types/node": "^20",
+    "typescript": "^5"
+  }
+}
