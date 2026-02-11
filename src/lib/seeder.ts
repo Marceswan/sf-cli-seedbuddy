@@ -31,10 +31,21 @@ import {
 // Internal types
 // ---------------------------------------------------------------------------
 
+interface SaveError {
+  statusCode: string;
+  message: string;
+  fields: string[];
+}
+
 interface InsertResult {
   id?: string;
   success: boolean;
-  errors?: string[];
+  errors?: SaveError[];
+}
+
+function formatErrors(errors?: SaveError[]): string {
+  if (!errors || errors.length === 0) return 'Unknown error';
+  return errors.map((e) => `${e.statusCode}: ${e.message}${e.fields?.length ? ` [${e.fields.join(', ')}]` : ''}`).join('; ');
 }
 
 // ---------------------------------------------------------------------------
@@ -70,18 +81,21 @@ function prepareRecord(
   record: Record<string, unknown>,
   insertableFields: string[],
   lookupFields: FieldInfo[],
+  allReferenceFields: FieldInfo[],
   idMaps: IdMapCollection,
   errors: SeedError[],
   objectApiName: string
 ): Record<string, unknown> | null {
   const prepared: Record<string, unknown> = {};
   const insertableSet = new Set(insertableFields);
+  const allRefFieldNames = new Set(allReferenceFields.map((f) => f.name));
+  const inScopeFieldNames = new Set(lookupFields.map((f) => f.name));
 
   for (const fieldName of insertableSet) {
     const value = record[fieldName];
     if (value === undefined) continue;
 
-    // Check if this is a lookup field that needs remapping
+    // Check if this is an in-scope lookup field that needs remapping
     const lookupField = lookupFields.find((f) => f.name === fieldName);
 
     if (lookupField && value !== null) {
@@ -103,6 +117,9 @@ function prepareRecord(
         });
         return null;
       }
+    } else if (allRefFieldNames.has(fieldName) && !inScopeFieldNames.has(fieldName) && value !== null) {
+      // Out-of-scope reference field — source ID won't exist in target, strip it
+      continue;
     } else {
       prepared[fieldName] = value;
     }
@@ -157,7 +174,7 @@ async function batchInsert(
           object: objectApiName,
           sourceId: batchSourceIds[j],
           stage: 'insert',
-          error: r.errors?.join(', ') ?? 'Unknown insert error',
+          error: formatErrors(r.errors),
         });
       }
     }
@@ -218,7 +235,7 @@ async function batchUpsert(
           object: objectApiName,
           sourceId: batchSourceIds[j],
           stage: 'upsert',
-          error: (r.errors as unknown as string[])?.join(', ') ?? 'Unknown upsert error',
+          error: formatErrors(r.errors),
         });
       }
     }
@@ -282,8 +299,14 @@ async function seedCoreObject(
 
   logger.startSpinner(`Querying ${objectApiName} from source...`);
 
-  const fields = await getObjectFields(sourceConn, objectApiName);
-  const insertableFields = getInsertableFieldNames(fields);
+  const sourceFields = await getObjectFields(sourceConn, objectApiName);
+  const sourceInsertable = getInsertableFieldNames(sourceFields);
+
+  // Intersect with target's createable fields to avoid schema mismatches
+  const targetFields = await getObjectFields(targetConn, objectApiName);
+  const targetCreateable = new Set(targetFields.filter((f) => f.createable).map((f) => f.name));
+  const insertableFields = sourceInsertable.filter((f) => targetCreateable.has(f));
+
   const selectFields = buildSelectFields(insertableFields);
   const soql = buildSeedQuery(selectFields, objectApiName, config.whereClause, config.recordCount);
 
@@ -298,16 +321,27 @@ async function seedCoreObject(
   const coreIdMap: IdMap = new Map();
   idMaps[objectApiName] = coreIdMap;
 
-  // No lookup remapping needed for core object (it's the root)
+  // For core object, null out lookup fields that reference records not in the target.
+  // Since it's the root, there are no IdMaps yet — any lookup pointing to a non-standard
+  // object (ParentId to self, RecordTypeId, etc.) would cause INVALID_CROSS_REFERENCE_KEY.
+  const lookupFieldNames = new Set(
+    sourceFields
+      .filter((f) => f.createable && f.referenceTo.length > 0 && f.type === 'reference')
+      .map((f) => f.name)
+  );
+
   const prepared: Array<Record<string, unknown>> = [];
   const preparedSourceIds: string[] = [];
 
   for (const rec of sourceRecords) {
     const p: Record<string, unknown> = {};
     for (const fname of insertableFields) {
-      if (rec[fname] !== undefined) {
-        p[fname] = rec[fname];
+      if (rec[fname] === undefined) continue;
+      if (lookupFieldNames.has(fname) && rec[fname] !== null) {
+        // Skip lookup values — source IDs won't exist in target
+        continue;
       }
+      p[fname] = rec[fname];
     }
     prepared.push(p);
     preparedSourceIds.push(rec['Id'] as string);
@@ -365,13 +399,24 @@ async function seedRelatedObject(
 
   logger.startSpinner(`Querying ${objectApiName} from source...`);
 
-  const fields = await getObjectFields(sourceConn, objectApiName);
-  const insertableFields = getInsertableFieldNames(fields);
+  const sourceFields = await getObjectFields(sourceConn, objectApiName);
+  const sourceInsertable = getInsertableFieldNames(sourceFields);
+
+  // Intersect with target's createable fields to avoid schema mismatches
+  const targetFields = await getObjectFields(targetConn, objectApiName);
+  const targetCreateable = new Set(targetFields.filter((f) => f.createable).map((f) => f.name));
+  const insertableFields = sourceInsertable.filter((f) => targetCreateable.has(f));
+
   const selectFields = buildSelectFields(insertableFields);
 
   // Build set of all objects in scope for lookup remapping
   const objectsInScope = new Set(Object.keys(idMaps));
-  const lookupFields = findLookupFieldsToRemap(fields, objectsInScope);
+  const lookupFields = findLookupFieldsToRemap(sourceFields, objectsInScope);
+
+  // All reference fields (for stripping out-of-scope lookups)
+  const allReferenceFields = sourceFields.filter(
+    (f) => f.createable && f.referenceTo.length > 0 && f.type === 'reference'
+  );
 
   // Query children WHERE lookup IN (parent source IDs)
   const sourceRecords = await queryAllChunked(
@@ -402,7 +447,7 @@ async function seedRelatedObject(
   let skipped = 0;
 
   for (const rec of sourceRecords) {
-    const p = prepareRecord(rec, insertableFields, lookupFields, idMaps, errors, objectApiName);
+    const p = prepareRecord(rec, insertableFields, lookupFields, allReferenceFields, idMaps, errors, objectApiName);
     if (p) {
       prepared.push(p);
       preparedSourceIds.push(rec['Id'] as string);
@@ -465,8 +510,8 @@ async function seedActivities(
 
   logger.startSpinner(`Querying ${activityType}s from source...`);
 
-  const fields = await getObjectFields(sourceConn, activityType);
-  const insertableFields = fields
+  const sourceFields = await getObjectFields(sourceConn, activityType);
+  const sourceInsertable = sourceFields
     .filter((f) => {
       if (!f.createable) return false;
       if (ACTIVITY_SYSTEM_FIELDS.has(f.name)) return false;
@@ -474,6 +519,11 @@ async function seedActivities(
       return true;
     })
     .map((f) => f.name);
+
+  // Intersect with target's createable fields to avoid schema mismatches
+  const targetFields = await getObjectFields(targetConn, activityType);
+  const targetCreateable = new Set(targetFields.filter((f) => f.createable).map((f) => f.name));
+  const insertableFields = sourceInsertable.filter((f) => targetCreateable.has(f));
 
   const selectFields = buildSelectFields(insertableFields, ['WhatId', 'WhoId']);
   const allSourceIds = getAllSourceIds(idMaps);
@@ -702,7 +752,7 @@ async function seedFiles(
           object: 'ContentVersion',
           sourceId: cvId,
           stage: 'upload',
-          error: (result.errors as string[])?.join(', ') ?? 'Unknown upload error',
+          error: formatErrors(result.errors),
         });
       }
     } catch (err) {
@@ -751,7 +801,7 @@ async function seedFiles(
         errors.push({
           object: 'ContentDocumentLink',
           stage: 'link',
-          error: r.errors?.join(', ') ?? 'Unknown link error',
+          error: formatErrors(r.errors),
         });
       }
     }
